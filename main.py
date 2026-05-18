@@ -136,7 +136,7 @@ def scrape_gunb_recent_applications(
 
     for page in range(1, max_pages + 1):
         params = {"page": page}
-        url = f"{base_url}?{urlencode(params)}" if params else base_url
+        url = f"{base_url}?{urlencode(params)}"
         html = fetch_html(session, url)
         if not html:
             continue
@@ -264,9 +264,10 @@ def build_system_prompt() -> str:
         "and shows strong signals of green business/innovation investments (circular economy, "
         "energy-efficient machinery, thermomodernization, new green technologies) worth at least "
         "3,000,000 PLN. If any criterion is missing, reject. "
-        "Respond ONLY with a JSON object matching schema: "
-        '{"is_lead": boolean, "company_name": string|null, "location": string|null, '
-        '"investment_signal": string, "reason": string}.'
+        "Respond ONLY with a JSON object with keys and value types: "
+        '"is_lead" (boolean), "company_name" (string or null), '
+        '"location" (string or null), "investment_signal" (string), '
+        '"reason" (string).'
     )
 
 
