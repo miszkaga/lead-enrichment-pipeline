@@ -48,6 +48,10 @@ EXPANSION_ROLE_KEYWORDS = (
     "technolog",
 )
 
+INVESTMENT_MIN_PLN = 3_000_000
+EXCLUDED_CITIES = ("Warsaw", "Wrocław", "Poznań")
+EXCLUDED_INDUSTRIES = ("agricultural production",)
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -257,13 +261,15 @@ def scrape_olx_job_offers(
 
 
 def build_system_prompt() -> str:
+    excluded_cities = ", ".join(EXCLUDED_CITIES)
+    excluded_industries = ", ".join(EXCLUDED_INDUSTRIES)
     return (
         "You are a strict B2B lead qualification engine for Polish manufacturing SMEs. "
         "Evaluate if the company fits ALL criteria: manufacturing SME (micro/small/medium), "
-        "located in Poland but NOT in Warsaw, Wrocław, or Poznań, NOT in agricultural production, "
+        f"located in Poland but NOT in {excluded_cities}, NOT in {excluded_industries}, "
         "and shows strong signals of green business/innovation investments (circular economy, "
         "energy-efficient machinery, thermomodernization, new green technologies) worth at least "
-        "3,000,000 PLN. If any criterion is missing, reject. "
+        f"{INVESTMENT_MIN_PLN:,.0f} PLN. If any criterion is missing, reject. "
         "Respond ONLY with a JSON object with keys and value types: "
         '"is_lead" (boolean), "company_name" (string or null), '
         '"location" (string or null), "investment_signal" (string), '
@@ -274,7 +280,10 @@ def build_system_prompt() -> str:
 def call_openai_api(text: str) -> dict:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY environment variable is required.")
+        raise RuntimeError(
+            "OPENAI_API_KEY environment variable is required. "
+            "Set it with your OpenAI API key from https://platform.openai.com/api-keys."
+        )
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0,
@@ -292,7 +301,11 @@ def call_openai_api(text: str) -> dict:
         OPENAI_API_URL, headers=headers, data=json.dumps(payload), timeout=REQUEST_TIMEOUT_SECONDS
     )
     response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
+    data = response.json()
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected OpenAI response structure: {data}") from exc
     return parse_json_response(content)
 
 
@@ -342,8 +355,11 @@ def export_leads(leads: list[dict], output_path: str) -> None:
         logging.info("No leads qualified. Skipping export.")
         return
     df = pd.DataFrame(leads)
-    df.to_excel(output_path, index=False)
-    logging.info("Exported %s leads to %s", len(leads), output_path)
+    try:
+        df.to_excel(output_path, index=False)
+        logging.info("Exported %s leads to %s", len(leads), output_path)
+    except (OSError, PermissionError) as exc:
+        logging.error("Failed to export leads to %s: %s", output_path, exc)
 
 
 def main() -> None:
