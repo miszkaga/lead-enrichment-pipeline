@@ -23,6 +23,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 REQUEST_TIMEOUT = 20
 REQUEST_DELAY_RANGE = (1.0, 2.5)
 MAX_TEXT_LENGTH = 6000
+TRUNCATION_BUFFER = 200
 
 GUNB_KEYWORDS = (
     "hala",
@@ -92,7 +93,7 @@ def normalize_text(text: str) -> str:
 def truncate_text(text: str, max_length: int = MAX_TEXT_LENGTH) -> str:
     if len(text) <= max_length:
         return text
-    return text[: max_length - 200] + " ... [truncated]"
+    return text[: max_length - TRUNCATION_BUFFER] + " ... [truncated]"
 
 
 def is_relevant_gunb_row(text: str) -> bool:
@@ -100,11 +101,11 @@ def is_relevant_gunb_row(text: str) -> bool:
     return any(keyword in lower_text for keyword in GUNB_KEYWORDS)
 
 
-def extract_table_rows(table: BeautifulSoup) -> Iterable[list[str]]:
+def extract_table_rows(table: BeautifulSoup) -> Iterable[tuple[BeautifulSoup, list[str]]]:
     for row in table.find_all("tr"):
         cols = [normalize_text(col.get_text(" ", strip=True)) for col in row.find_all(["td", "th"])]
         if cols:
-            yield cols
+            yield row, cols
 
 
 def map_gunb_row(headers: list[str], row: list[str]) -> dict:
@@ -144,13 +145,13 @@ def scrape_gunb_recent_applications(
             rows = list(extract_table_rows(table))
             if not rows:
                 continue
-            headers = rows[0]
-            for row in rows[1:]:
+            headers = rows[0][1]
+            for row_element, row in rows[1:]:
                 row_text = normalize_text(" ".join(row))
                 if not is_relevant_gunb_row(row_text):
                     continue
                 mapped = map_gunb_row(headers, row)
-                link = table.find("a", href=True)
+                link = row_element.find("a", href=True)
                 detail_url = urljoin(GUNB_BASE_URL, link["href"]) if link else None
                 items.append(
                     ScrapedItem(
