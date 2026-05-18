@@ -51,6 +51,7 @@ EXPANSION_ROLE_KEYWORDS = (
 INVESTMENT_MIN_PLN = 3_000_000
 EXCLUDED_CITIES = ("Warsaw", "Wrocław", "Poznań")
 EXCLUDED_INDUSTRIES = ("agricultural production",)
+OUTPUT_FILE = os.getenv("OUTPUT_FILE", "Green_Investments_Leads_MVP.xlsx")
 
 HEADERS = {
     "User-Agent": (
@@ -273,7 +274,7 @@ def build_system_prompt() -> str:
         "Respond ONLY with a JSON object with keys and value types: "
         '"is_lead" (boolean), "company_name" (string or null), '
         '"location" (string or null), "investment_signal" (string), '
-        '"reason" (string).'
+        '"reason" (string, 1-2 sentences explaining why it fits or was rejected).'
     )
 
 
@@ -382,7 +383,7 @@ def main() -> None:
 
     logging.info("Qualifying %s items with OpenAI...", len(all_items))
     leads = qualify_items(all_items)
-    export_leads(leads, "Green_Investments_Leads_MVP.xlsx")
+    export_leads(leads, OUTPUT_FILE)
 
 
 if __name__ == "__main__":
