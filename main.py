@@ -20,10 +20,12 @@ OLX_CATEGORY_PATH = os.getenv("OLX_CATEGORY_PATH", "/praca/produkcja/")
 OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT_SECONDS = 20
 REQUEST_DELAY_RANGE = (1.0, 2.5)
 MAX_TEXT_LENGTH = 6000
 TRUNCATION_BUFFER = 200
+MAX_RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_MULTIPLIER = 2
 
 GUNB_KEYWORDS = (
     "hala",
@@ -73,16 +75,18 @@ def sleep_with_jitter() -> None:
 
 
 def fetch_html(session: requests.Session, url: str, params: Optional[dict] = None) -> Optional[str]:
-    for attempt in range(1, 4):
+    for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         try:
-            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             return response.text
         except requests.RequestException as exc:
-            logging.warning("Request failed (%s/%s) for %s: %s", attempt, 3, url, exc)
-            if attempt == 3:
+            logging.warning(
+                "Request failed (%s/%s) for %s: %s", attempt, MAX_RETRY_ATTEMPTS, url, exc
+            )
+            if attempt == MAX_RETRY_ATTEMPTS:
                 return None
-            time.sleep(2 * attempt)
+            time.sleep(RETRY_BACKOFF_MULTIPLIER * attempt)
     return None
 
 
@@ -284,7 +288,7 @@ def call_openai_api(text: str) -> dict:
         "Content-Type": "application/json",
     }
     response = requests.post(
-        OPENAI_API_URL, headers=headers, data=json.dumps(payload), timeout=REQUEST_TIMEOUT
+        OPENAI_API_URL, headers=headers, data=json.dumps(payload), timeout=REQUEST_TIMEOUT_SECONDS
     )
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
