@@ -133,12 +133,12 @@ def tavily_search(
     return {"results": [], "error": "unknown_error"}
 
 
-def _decode_cfemail(hex_data: str) -> str:
+def _decode_cloudflare_email(hex_data: str) -> str:
     try:
         data = bytes.fromhex(hex_data)
         key = data[0]
         return "".join(chr(byte ^ key) for byte in data[1:])
-    except Exception:  # noqa: BLE001
+    except ValueError:
         return ""
 
 
@@ -146,7 +146,7 @@ def _normalize_obfuscated_text(text: str) -> str:
     normalized = html.unescape(text or "")
 
     for m in re.finditer(r'data-cfemail=["\']([0-9a-fA-F]{6,})["\']', normalized):
-        decoded = _decode_cfemail(m.group(1))
+        decoded = _decode_cloudflare_email(m.group(1))
         if decoded:
             normalized += f" {decoded} "
 
@@ -246,7 +246,7 @@ def fetch_contact_raw_content(domain: str, company_name: str | None = None) -> s
     return "\n\n".join(chunk for chunk in merged_chunks if chunk)
 
 
-def safe_json_loads(text: str) -> Any:
+def safe_json_loads(text: str | None) -> Any:
     if text is None:
         raise ValueError("empty response")
 
@@ -256,7 +256,7 @@ def safe_json_loads(text: str) -> Any:
 
     try:
         return json.loads(cleaned)
-    except Exception:  # noqa: BLE001
+    except json.JSONDecodeError:
         pass
 
     starts = [idx for idx in (cleaned.find("{"), cleaned.find("[")) if idx != -1]

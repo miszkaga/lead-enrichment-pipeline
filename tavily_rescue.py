@@ -34,7 +34,7 @@ def fetch_http_contact_content(domain: str) -> str:
 
     urls = [f"https://{clean_domain}"] + [f"https://{clean_domain}/{path}" for path in COMMON_CONTACT_PATHS]
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; zielone-osint/1.0; +https://github.com/miszkaga/zielone-)"
+        "User-Agent": "Mozilla/5.0 (compatible; zielone-osint/1.0; +https://github.com/miszkaga/zielone-/)"
     }
 
     chunks: list[str] = []
