@@ -1,0 +1,148 @@
+import json
+import logging
+import os
+import pandas as pd
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+# Ładowanie zmiennych środowiskowych z .env
+load_dotenv()
+
+# --- KONFIGURACJA ANALIZATORA (TYLKO OLX) ---
+OUTPUT_EXCEL_FILE = "OLX_Leads_MVP.xlsx"
+INPUT_JSON_FILE = "raw_olx_data.json"
+
+# Kryteria z dokumentacji klienta
+EXCLUDED_CITIES = ("Warszawa", "Wrocław", "Poznań", "Warszawy", "Wrocławia", "Poznania")
+EXCLUDED_INDUSTRIES = ("rolnictwo", "produkcja rolna")
+
+def build_system_instruction() -> str:
+    ex_cities = ", ".join(EXCLUDED_CITIES)
+    ex_ind = ", ".join(EXCLUDED_INDUSTRIES)
+    return (
+        "Jesteś analitykiem biznesowym. Szukasz potencjalnych leadów dla programu dotacyjnego 'Zielony Biznes i Innowacje' "
+        "na podstawie ogłoszeń o pracę.\n\n"
+        f"BEZWZGLĘDNE WYKLUCZENIA (odrzuć od razu, 'is_lead': false): "
+        f"1. Firma znajduje się w jednym z miast: {ex_cities}. "
+        f"2. Firma działa w branży: {ex_ind}. "
+        f"3. Firma to potężna globalna korporacja (szukamy MŚP) lub agencja pracy tymczasowej "
+        f"(odrzucaj ogłoszenia zaczynające się od 'Dla naszego klienta poszukujemy...').\n\n"
+        "KRYTERIA POZYTYWNE:\n"
+        "1. Uznaj firmę za LEAD ('is_lead': true), jeśli tekst sugeruje, że to stabilny zakład produkcyjny, który się ROZWIJA. "
+        "2. Szukaj sygnałów w tekście takich jak: 'nowoczesny park maszynowy', 'automatyzacja', 'nowa linia produkcyjna', 'nowy zakład'. "
+        "3. Zatrudnianie specjalistów takich jak inżynier procesu, technolog, operator CNC czy kierownik utrzymania ruchu "
+        "często świadczy o modernizacji i chęci wdrażania innowacji. "
+        "WAŻNE: Postaraj się zawsze wyciągnąć rzeczywistą nazwę firmy z treści ogłoszenia."
+    )
+
+def call_gemini_api(client: genai.Client, text: str) -> dict:
+    """Wysyła zapytanie do Gemini żądając strukturyzowanego JSON-a"""
+
+    json_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "is_lead": types.Schema(type=types.Type.BOOLEAN, description="Czy firma spełnia wszystkie kryteria programu?"),
+            "company_name": types.Schema(type=types.Type.STRING, description="Nazwa firmy wyciągnięta z tekstu lub null"),
+            "location": types.Schema(type=types.Type.STRING, description="Miasto/Lokalizacja firmy lub null"),
+            "investment_signal": types.Schema(type=types.Type.STRING, description="Opis wykrytego sygnału inwestycyjnego"),
+            "reason": types.Schema(type=types.Type.STRING, description="Uzasadnienie decyzji (max 2 zdania)")
+        },
+        required=["is_lead", "company_name", "location", "investment_signal", "reason"]
+    )
+
+    config = types.GenerateContentConfig(
+        system_instruction=build_system_instruction(),
+        temperature=0.1,
+        response_mime_type="application/json",
+        response_schema=json_schema
+    )
+
+    # Używamy wersji flash - jest najszybsza i najtańsza do masowej analizy
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=text[:8000],
+        config=config
+    )
+
+    return json.loads(response.text)
+
+def process_leads(raw_items: list[dict]) -> list[dict]:
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("Brak zmiennej środowiskowej GEMINI_API_KEY w pliku .env")
+
+    client = genai.Client()
+    valid_leads = []
+
+    for idx, item in enumerate(raw_items):
+        logging.info("Analiza przez Gemini (%d/%d): %s...", idx + 1, len(raw_items), item.get('title', 'Brak tytułu')[:40])
+
+        # Proste mapowanie payloadu wyłącznie dla OLX
+        payload_text = f"Źródło: {item.get('source', 'OLX')}\nTytuł: {item.get('title', '')}\nTreść: {item.get('text', '')}"
+
+        try:
+            ai_result = call_gemini_api(client, payload_text)
+
+            if ai_result.get("is_lead") is True:
+                valid_leads.append({
+                    "Nazwa Firmy": ai_result.get("company_name") or item.get("company_name") or "Nieznana",
+                    "Lokalizacja": ai_result.get("location") or item.get("location") or "Nieznana",
+                    "Źródło": item.get("source", "OLX"),
+                    "Sygnał Inwestycyjny": ai_result.get("investment_signal"),
+                    "Uzasadnienie (Gemini)": ai_result.get("reason"),
+                    "Link": item.get("url", "")
+                })
+                logging.info("[+] ZNALEZIONO LEAD: %s", valid_leads[-1]["Nazwa Firmy"])
+            else:
+                logging.info("[-] Odrzucono. Powód: %s", ai_result.get("reason"))
+        except Exception as e:
+            logging.error("Błąd API Gemini dla elementu: %s", e)
+
+    return valid_leads
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # 1. Zbieramy dane TYLKO Z OLX
+    raw_items = []
+
+    if os.path.exists(INPUT_JSON_FILE):
+        with open(INPUT_JSON_FILE, "r", encoding="utf-8") as f:
+            dane = json.load(f)
+            raw_items.extend(dane)
+            logging.info("Załadowano %d elementów z pliku %s", len(dane), INPUT_JSON_FILE)
+    else:
+        logging.error(f"Nie znaleziono pliku {INPUT_JSON_FILE}. Uruchom najpierw skrypt scrapujący OLX.")
+        return
+
+    if not raw_items:
+        logging.info("Plik OLX jest pusty. Koniec pracy.")
+        return
+
+    logging.info("Załadowano łącznie %d elementów do analizy przez Gemini.", len(raw_items))
+
+    # 2. Przetwarzanie przez Gemini
+    leads = process_leads(raw_items)
+
+    # 3. Zapis pozytywnych wyników do nowego pliku Excel
+    if leads:
+        df = pd.DataFrame(leads)
+
+        # Usuwamy ukryte znaki kontrolne (błąd Excela)
+        df = df.replace(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', regex=True)
+
+        # Usuwamy wiersze, gdzie AI nie znalazło nazwy firmy
+        df = df[df["Nazwa Firmy"].notna()]
+        df = df[df["Nazwa Firmy"].str.lower() != "nieznana"]
+        df = df[df["Nazwa Firmy"].str.lower() != "null"]
+
+        # AUTOMATYCZNA DEDUPLIKACJA: Zostawiamy tylko jeden rekord dla danej firmy
+        df = df.drop_duplicates(subset=["Nazwa Firmy"], keep="first")
+
+        df.to_excel(OUTPUT_EXCEL_FILE, index=False)
+        logging.info("Sukces! Wyeksportowano %d UNIKALNYCH, czystych leadów do pliku %s", len(df), OUTPUT_EXCEL_FILE)
+    else:
+        logging.info("Zakończono analizę. Żaden element z OLX nie spełnił kryteriów.")
+
+if __name__ == "__main__":
+    main()

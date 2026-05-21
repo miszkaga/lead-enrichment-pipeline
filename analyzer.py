@@ -10,11 +10,9 @@ from google.genai import types
 load_dotenv()
 
 # --- KONFIGURACJA ANALIZATORA ---
-INPUT_JSON_FILE = "raw_scraped_data.json"
 OUTPUT_EXCEL_FILE = "Green_Investments_Leads_MVP.xlsx"
 
 # Kryteria z dokumentacji klienta
-INVESTMENT_MIN_PLN = 3_000_000
 EXCLUDED_CITIES = ("Warszawa", "Wrocław", "Poznań", "Warszawy", "Wrocławia", "Poznania")
 EXCLUDED_INDUSTRIES = ("rolnictwo", "produkcja rolna")
 
@@ -27,18 +25,19 @@ def build_system_instruction() -> str:
         f"1. Firma znajduje się w jednym z miast: {ex_cities}. "
         f"2. Firma działa w branży: {ex_ind}. "
         f"3. Firma to potężna globalna korporacja (szukamy MŚP) lub agencja pracy tymczasowej.\n\n"
-        "KRYTERIA POZYTYWNE (Złagodzone): "
-        "Nie szukaj twardych dowodów na inwestycję rzędu 3 mln PLN. Uznaj firmę za LEAD ('is_lead': true), "
-        "jeśli tekst ogłoszenia sugeruje, że to stabilny zakład produkcyjny, który się ROZWIJA. "
-        "Szukaj sygnałów takich jak: 'nowoczesny park maszynowy', 'automatyzacja', 'optymalizacja procesów', "
-        "'nowa linia produkcyjna', 'innowacje', 'rozwój działu', 'utrzymanie ruchu', 'nowe technologie'. "
-        "Nawet chęć zatrudnienia inżyniera procesu lub technologa do usprawnienia produkcji to wystarczający powód, "
-        "by uznać to za szansę na inwestycję i wysłać maila zapoznawczego."
+        "KRYTERIA POZYTYWNE:\n"
+        "1. JEŚLI ŹRÓDŁO TO OGŁOSZENIE O PRACĘ (OLX): Uznaj firmę za LEAD ('is_lead': true), "
+        "jeśli tekst sugeruje, że to stabilny zakład produkcyjny, który się ROZWIJA. "
+        "Szukaj sygnałów: 'nowoczesny park maszynowy', 'automatyzacja', 'nowa linia produkcyjna'. "
+        "Nawet chęć zatrudnienia inżyniera procesu lub technologa to wystarczający powód na lead.\n"
+        "2. JEŚLI ŹRÓDŁO TO WNIOSEK BUDOWLANY (GUNB): Uznaj firmę za LEAD ('is_lead': true), "
+        "jeśli zamierzenie dotyczy budowy, rozbudowy hali produkcyjnej, magazynu, zakładu lub instalacji "
+        "fotowoltaicznej/pomp ciepła dla firmy. To twardy dowód na potężną inwestycję."
     )
+
 def call_gemini_api(client: genai.Client, text: str) -> dict:
     """Wysyła zapytanie do Gemini żądając strukturyzowanego JSON-a"""
 
-    # Definiujemy dokładną strukturę JSON, jakiej oczekujemy od Gemini
     json_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
@@ -51,7 +50,6 @@ def call_gemini_api(client: genai.Client, text: str) -> dict:
         required=["is_lead", "company_name", "location", "investment_signal", "reason"]
     )
 
-    # Konfiguracja żądania
     config = types.GenerateContentConfig(
         system_instruction=build_system_instruction(),
         temperature=0.1,
@@ -59,17 +57,16 @@ def call_gemini_api(client: genai.Client, text: str) -> dict:
         response_schema=json_schema
     )
 
-    # Wywołanie modelu gemini-1.5-flash (szybki, tani i świetny do struktur)
+    # Używamy wersji flash - jest najszybsza i najtańsza do masowej analizy
     response = client.models.generate_content(
         model='gemini-2.5-flash',
-        contents=text[:8000],  # Bezpieczne przycięcie tekstu
+        contents=text[:8000],
         config=config
     )
 
     return json.loads(response.text)
 
 def process_leads(raw_items: list[dict]) -> list[dict]:
-    # Inicjalizacja oficjalnego klienta Gemini (automatycznie bierze klucz z GEMINI_API_KEY)
     if not os.getenv("GEMINI_API_KEY"):
         raise RuntimeError("Brak zmiennej środowiskowej GEMINI_API_KEY w pliku .env")
 
@@ -77,9 +74,14 @@ def process_leads(raw_items: list[dict]) -> list[dict]:
     valid_leads = []
 
     for idx, item in enumerate(raw_items):
-        logging.info("Analiza przez Gemini (%d/%d): %s", idx + 1, len(raw_items), item.get('title', 'Brak tytułu')[:40])
+        logging.info("Analiza przez Gemini (%d/%d): %s...", idx + 1, len(raw_items), item.get('title', 'Brak tytułu')[:40])
 
-        payload_text = f"Źródło: {item['source']}\nTytuł: {item['title']}\nTreść: {item['text']}"
+        # Jeśli to GUNB, pobieramy odpowiednie nazwy z JSONA
+        if "GUNB" in item.get('source', ''):
+            payload_text = f"Źródło: {item['source']}\nZamierzenie budowlane: {item['title']}\nInwestor: {item.get('company_name', 'Nieznany')}\nSzczegóły: {item['text']}"
+        else:
+            payload_text = f"Źródło: {item['source']}\nTytuł: {item['title']}\nTreść: {item['text']}"
+
         try:
             ai_result = call_gemini_api(client, payload_text)
 
@@ -105,10 +107,14 @@ def main():
 
     # 1. Zbieramy dane z obydwu źródeł
     raw_items = []
-    for file_name in ["raw_olx_data.json", "raw_gunb_data.json"]:
+
+    # TUTAJ ZMIANA: Dodano nową nazwę pliku z bota z Playwright
+    for file_name in ["raw_olx_data.json", "gunb_live_data.json"]:
         if os.path.exists(file_name):
             with open(file_name, "r", encoding="utf-8") as f:
-                raw_items.extend(json.load(f))
+                dane = json.load(f)
+                raw_items.extend(dane)
+                logging.info("Załadowano %d elementów z pliku %s", len(dane), file_name)
 
     if not raw_items:
         logging.error("Nie znaleziono żadnych danych z OLX ani GUNB. Uruchom najpierw skrypty scrapujące.")
@@ -118,25 +124,24 @@ def main():
 
     leads = process_leads(raw_items)
 
-
     if leads:
         df = pd.DataFrame(leads)
 
         # 1. Usuwamy ukryte znaki kontrolne (błąd Excela)
         df = df.replace(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', regex=True)
 
-        # 2. Usuwamy wiersze, gdzie AI nie znalazło nazwy firmy (null / Nieznana)
+        # 2. Usuwamy wiersze, gdzie AI nie znalazło nazwy firmy
         df = df[df["Nazwa Firmy"].notna()]
         df = df[df["Nazwa Firmy"] != "Nieznana"]
         df = df[df["Nazwa Firmy"] != "null"]
 
         # 3. AUTOMATYCZNA DEDUPLIKACJA: Zostawiamy tylko jeden rekord dla danej firmy
-        # Dzięki temu prezes dostanie tylko 1 maila, nawet jeśli wystawił 10 ogłoszeń
         df = df.drop_duplicates(subset=["Nazwa Firmy"], keep="first")
 
         df.to_excel(OUTPUT_EXCEL_FILE, index=False)
         logging.info("Sukces! Wyeksportowano %d UNIKALNYCH, czystych leadów do %s", len(df), OUTPUT_EXCEL_FILE)
     else:
         logging.info("Zakończono analizę. Żaden element nie spełnił kryteriów.")
+
 if __name__ == "__main__":
     main()
