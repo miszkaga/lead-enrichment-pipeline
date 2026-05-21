@@ -1,15 +1,22 @@
-import os
-import json
-import time
-import logging
-import pandas as pd
 import concurrent.futures
+import json
+import logging
+import os
+
+import pandas as pd
 from dotenv import load_dotenv
-from tavily import TavilyClient
-from google import genai
 from google.genai import types
 
-# 1. Ładowanie kluczy
+from osint_pipeline import (
+    build_search_queries,
+    extract_emails_phones,
+    fetch_contact_raw_content,
+    gemini_generate_json,
+    guess_domain_from_company,
+    infer_domain_from_results,
+    tavily_search,
+)
+
 load_dotenv()
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -17,15 +24,15 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not TAVILY_API_KEY or not GEMINI_API_KEY:
     raise ValueError("Brak kluczy API w pliku .env (TAVILY_API_KEY lub GEMINI_API_KEY)")
 
-tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-gemini_client = genai.Client()
-
 INPUT_EXCEL = "Green_Investments_Leads_MVP.xlsx"
 OUTPUT_EXCEL = "GUNB_Enriched_Scored_Leads.xlsx"
 CACHE_FILE = "tavily_cache_gunb.json"
 
-# Konfiguracja wielowątkowości
-MAX_WORKERS = 15  # Ilość równoległych zapytań. Zwiększ do 10, jeśli masz podpiętą kartę kredytową w Google Cloud
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "5"))
+TAVILY_DEPTH = os.environ.get("TAVILY_SEARCH_DEPTH", "basic")
+TAVILY_MAX_RESULTS = int(os.environ.get("TAVILY_MAX_RESULTS", "5"))
+GEMINI_MIN_INTERVAL_SECONDS = float(os.environ.get("GEMINI_MIN_INTERVAL_SECONDS", "1.2"))
+
 
 def build_verification_instruction() -> str:
     return (
@@ -39,23 +46,67 @@ def build_verification_instruction() -> str:
         "   - 8-10: Ciężka produkcja, odlewnie, CNC (wysoka energochłonność).\n"
         "   - 5-7: Lekka produkcja, stolarnie, przetwórstwo spożywcze.\n"
         "   - 1-4: Usługi, logistyka, handel.\n\n"
-        "Ważne: Jeśli dane są niepełne, ustaw STATUS 'DO_WERYFIKACJI' i niską ocenę (np. 3), ale NIE odrzucaj."
+        "Ważne: Jeśli dane są niepełne, ustaw STATUS 'DO_WERYFIKACJI' i niską ocenę (np. 3), ale NIE odrzucaj.\n"
+        "Jeśli Structured Context zawiera domenę/maile/telefony, traktuj je jako priorytet."
     )
 
-def verify_and_score_company(company_name: str, retries: int = 3) -> tuple[dict, list]:
-    logging.info(f"🔍 [Tavily] Szukam: {company_name}...")
 
-    raw_results = []
-    try:
-        search_query = f'"{company_name}" NIP KRS zarząd kontakt email produkcja branża'
-        tavily_response = tavily_client.search(query=search_query, search_depth="basic", max_results=5)
-        raw_results = tavily_response.get("results", [])
+def _collect_tavily_snippets(company_name: str) -> list[dict]:
+    merged_results: list[dict] = []
+    seen_urls: set[str] = set()
 
-        search_context = "\n\n".join([f"Tytuł: {res.get('title', '')}\nURL: {res.get('url', '')}\nTreść: {res.get('content', '')}" for res in raw_results])
-        if not search_context.strip(): search_context = "Brak danych."
-    except Exception as e:
-        logging.error(f"Błąd Tavily dla {company_name}: {e}")
-        search_context = "Błąd."
+    for query in build_search_queries(company_name):
+        response = tavily_search(query=query, depth=TAVILY_DEPTH, max_results=TAVILY_MAX_RESULTS)
+        if response.get("error"):
+            logging.error("[Tavily ERROR] %s | %s", company_name, response["error"])
+        for item in response.get("results", []):
+            url = item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            merged_results.append(item)
+
+    if not merged_results:
+        logging.info("[Tavily EMPTY] Brak wyników snippetów dla: %s", company_name)
+
+    return merged_results
+
+
+def verify_and_score_company(company_name: str) -> tuple[dict, list]:
+    logging.info("🔍 [Tavily] Szukam: %s...", company_name)
+
+    raw_results = _collect_tavily_snippets(company_name)
+    search_context = "\n\n".join(
+        [
+            f"Tytuł: {res.get('title', '')}\nURL: {res.get('url', '')}\nTreść: {res.get('content', '')}"
+            for res in raw_results
+        ]
+    )
+    if not search_context.strip():
+        search_context = "Brak danych."
+
+    inferred_domain = infer_domain_from_results(raw_results)
+    snippet_contacts = extract_emails_phones(search_context)
+
+    should_rescue = not snippet_contacts["emails"] or not inferred_domain
+    rescue_source = "none"
+    rescue_contacts = {"emails": [], "phones": []}
+
+    if should_rescue:
+        domain_for_rescue = inferred_domain or guess_domain_from_company(company_name)
+        raw_contact_context = fetch_contact_raw_content(domain_for_rescue, company_name=company_name)
+        rescue_contacts = extract_emails_phones(raw_contact_context)
+        rescue_source = "tavily_raw" if raw_contact_context else "none"
+
+    merged_emails = list(dict.fromkeys(snippet_contacts["emails"] + rescue_contacts["emails"]))
+    merged_phones = list(dict.fromkeys(snippet_contacts["phones"] + rescue_contacts["phones"]))
+
+    structured_context = {
+        "inferred_domain": inferred_domain or "Brak danych",
+        "emails_from_regex": merged_emails or ["Brak danych"],
+        "phones_from_regex": merged_phones or ["Brak danych"],
+        "rescue_source": rescue_source,
+    }
 
     json_schema = types.Schema(
         type=types.Type.OBJECT,
@@ -65,44 +116,47 @@ def verify_and_score_company(company_name: str, retries: int = 3) -> tuple[dict,
             "lead_score": types.Schema(type=types.Type.INTEGER, description="Ocena 1-10"),
             "board_members": types.Schema(type=types.Type.STRING, description="Prezes/Właściciel"),
             "domain": types.Schema(type=types.Type.STRING, description="Domena www"),
-            "emails_found": types.Schema(type=types.Type.STRING, description="Maile")
+            "emails_found": types.Schema(type=types.Type.STRING, description="Maile"),
         },
-        required=["status", "scoring_reason", "lead_score", "board_members", "domain", "emails_found"]
+        required=["status", "scoring_reason", "lead_score", "board_members", "domain", "emails_found"],
     )
 
-    config = types.GenerateContentConfig(
-        system_instruction=build_verification_instruction(),
-        temperature=0.1,
-        response_mime_type="application/json",
-        response_schema=json_schema
+    payload_text = (
+        f"Firma: {company_name}\n\n"
+        f"Structured Context (regex + domain):\n{json.dumps(structured_context, ensure_ascii=False)}\n\n"
+        f"Wyniki:\n{search_context}"
     )
 
-    # Pętla RETRY (Ponawiania) jeśli wyczerpiemy limit API
-    for attempt in range(retries):
-        try:
-            response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=f"Firma: {company_name}\n\nWyniki:\n{search_context}",
-                config=config
-            )
-            return json.loads(response.text), raw_results
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
-                logging.warning(f"⚠️ Limit API Gemini! Czekam 10s... ({company_name}) [Próba {attempt+1}/{retries}]")
-                time.sleep(10)
-            else:
-                logging.error(f"Błąd Gemini dla {company_name}: {e}")
-                break
+    try:
+        ai_data = gemini_generate_json(
+            payload_text=payload_text,
+            schema=json_schema,
+            system_instruction=build_verification_instruction(),
+            model="gemini-2.5-flash",
+            retries=3,
+            backoff=3.0,
+            min_interval_seconds=GEMINI_MIN_INTERVAL_SECONDS,
+        )
 
-    # Fallback jeśli AI się podda
-    return {
-        "status": "DO_WERYFIKACJI", "scoring_reason": "Błąd połączenia z AI",
-        "lead_score": 0, "board_members": "Brak", "domain": "Brak", "emails_found": "Brak"
-    }, raw_results
+        if isinstance(ai_data, dict):
+            if str(ai_data.get("domain", "")).strip().lower() in {"", "brak danych", "brak", "błąd", "blad"}:
+                ai_data["domain"] = structured_context["inferred_domain"]
+            if str(ai_data.get("emails_found", "")).strip().lower() in {"", "brak danych", "brak", "błąd", "blad"}:
+                ai_data["emails_found"] = ", ".join(merged_emails) if merged_emails else "Brak danych"
+        return ai_data, raw_results
+    except Exception as exc:  # noqa: BLE001
+        logging.error("[Gemini ERROR] %s | %s", company_name, exc)
+        return {
+            "status": "DO_WERYFIKACJI",
+            "scoring_reason": "Błąd połączenia z AI",
+            "lead_score": 0,
+            "board_members": "Brak",
+            "domain": structured_context["inferred_domain"],
+            "emails_found": ", ".join(merged_emails) if merged_emails else "Brak danych",
+        }, raw_results
+
 
 def process_single_row(row):
-    """Funkcja pomocnicza do przetwarzania jednego wiersza (dla wielowątkowości)"""
     name = str(row.get("Nazwa Firmy", ""))
     if not name or name.lower() == "nan":
         return None
@@ -117,35 +171,31 @@ def process_single_row(row):
         "Uzasadnienie Potencjału": ai_data.get("scoring_reason", ""),
         "Zarząd / Właściciel": ai_data.get("board_members"),
         "Domena WWW": ai_data.get("domain"),
-        "Znalezione Maile": ai_data.get("emails_found")
+        "Znalezione Maile": ai_data.get("emails_found"),
     }
 
     cache_row = {"name": name, "ai": ai_data, "raw": raw_data}
-
     return excel_row, cache_row
+
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
     if not os.path.exists(INPUT_EXCEL):
-        logging.error(f"Brak pliku {INPUT_EXCEL}")
+        logging.error("Brak pliku %s", INPUT_EXCEL)
         return
 
     df = pd.read_excel(INPUT_EXCEL)
-    # df_test = df.head(20).copy() # Zakomentowane - robimy pełne 182 pozycje!
     df_test = df.copy()
 
     excel_results = []
     tavily_cache_data = []
 
-    logging.info(f"🚀 Startujemy! Analiza {len(df_test)} firm na {MAX_WORKERS} wątkach jednocześnie.")
+    logging.info("🚀 Startujemy! Analiza %s firm na %s wątkach jednocześnie.", len(df_test), MAX_WORKERS)
 
-    # Wielowątkowe przetwarzanie
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Zlecamy wszystkie zadania
         futures = {executor.submit(process_single_row, row): row for _, row in df_test.iterrows()}
 
-        # Odbieramy wyniki w miarę ich kończenia
         for future in concurrent.futures.as_completed(futures):
             try:
                 res = future.result()
@@ -153,30 +203,27 @@ def main():
                     excel_row, cache_row = res
                     excel_results.append(excel_row)
                     tavily_cache_data.append(cache_row)
-            except Exception as e:
-                logging.error(f"Wyjątek krytyczny w wątku: {e}")
+            except Exception as exc:  # noqa: BLE001
+                logging.error("Wyjątek krytyczny w wątku: %s", exc)
 
-    # Tworzenie Excela
     df_out = pd.DataFrame(excel_results)
 
-    # 1. Zabezpieczenie przed pustym plikiem
     if not df_out.empty:
-        # 2. POPRAWIONE SORTOWANIE (Kategoria Statusu, a potem Oceny)
-        df_out['Status'] = pd.Categorical(
-            df_out['Status'],
-            categories=['POZYTYWNY', 'DO_WERYFIKACJI', 'ODRZUCONY'],
-            ordered=True
+        df_out["Status"] = pd.Categorical(
+            df_out["Status"],
+            categories=["POZYTYWNY", "DO_WERYFIKACJI", "ODRZUCONY"],
+            ordered=True,
         )
-        df_out = df_out.sort_values(by=['Status', 'Potencjał (1-10)'], ascending=[True, False])
+        df_out = df_out.sort_values(by=["Status", "Potencjał (1-10)"], ascending=[True, False])
         df_out.to_excel(OUTPUT_EXCEL, index=False)
-        logging.info(f"✅ Gotowe! Zapisano {len(df_out)} przetworzonych firm do {OUTPUT_EXCEL}")
+        logging.info("✅ Gotowe! Zapisano %s przetworzonych firm do %s", len(df_out), OUTPUT_EXCEL)
     else:
         logging.warning("Brak wyników do zapisania.")
 
-    # Zapis Data Lake
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(tavily_cache_data, f, ensure_ascii=False, indent=4)
-        logging.info(f"✅ Zapisano zrzut pamięci do {CACHE_FILE}")
+    with open(CACHE_FILE, "w", encoding="utf-8") as file_handle:
+        json.dump(tavily_cache_data, file_handle, ensure_ascii=False, indent=4)
+        logging.info("✅ Zapisano zrzut pamięci do %s", CACHE_FILE)
+
 
 if __name__ == "__main__":
     main()
